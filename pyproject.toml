@@ -9,7 +9,7 @@ description = "Universal MRF CSV parser for hospital price transparency data"
 readme = "README.md"                     
 license = {text = "Apache-2.0"}            
 authors = [
-  {name = "Harshal Mankar", email = "harshalmankar61@gmail.com"} 
+  {name = "Harshal M", email = "harshalmankar61@gmail.com"} 
 ]
 keywords = ["mrf", "healthcare", "price-transparency", "etl", "cms"]
 classifiers = [                              
