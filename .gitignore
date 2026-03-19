@@ -17,3 +17,4 @@ mrf_output/
 *.csv.gz
 errors.txt
 failed_sources.txt
+*.pypirc
