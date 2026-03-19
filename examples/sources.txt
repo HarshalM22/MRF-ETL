@@ -1,0 +1,11 @@
+# Sample sources file for mrf-etl bulk command
+# One file path or URL per line
+# Lines starting with # are ignored
+
+# Local files
+/path/to/hospital1_standardcharges.csv
+/path/to/hospital2_standardcharges.csv
+
+# URLs 
+# https://www.hospital.org/standardcharges.csv
+# https://www.hospital.org/standardcharges.csv.gz

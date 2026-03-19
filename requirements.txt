@@ -1,0 +1,4 @@
+# Core — no dependencies (stdlib only)
+# Optional DB drivers:
+pymysql>=1.1          # for MySQL output
+psycopg2-binary>=2.9  # for Postgres output

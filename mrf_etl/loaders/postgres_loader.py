@@ -1,0 +1,324 @@
+"""
+postgres_loader.py
+PostgreSQL loader for mrf-etl.
+
+Features:
+  - Auto-creates all 5 tables on first run
+  - Bulk inserts using executemany
+  - Idempotency via source_file_hash
+  - Uses psycopg2 — standard Postgres driver
+
+Install: pip install psycopg2-binary
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Optional
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None  # type: ignore
+
+from mrf_etl.loaders.base_loader import BaseLoader, _json_safe
+from mrf_etl.schema.mrf_row import HospitalMeta
+
+
+# ---------------------------------------------------------------------------
+# DDL
+# ---------------------------------------------------------------------------
+
+DDL_HOSPITALS = """
+CREATE TABLE IF NOT EXISTS mrf_hospitals (
+    id                    SERIAL PRIMARY KEY,
+    hospital_name         VARCHAR(255),
+    hospital_locations    JSONB,
+    hospital_addresses    JSONB,
+    license_number        VARCHAR(50),
+    license_state         VARCHAR(10),
+    hospital_npi          VARCHAR(20),
+    attester_name         VARCHAR(255),
+    last_updated_on       DATE,
+    as_of_date            DATE,
+    financial_aid_policy  TEXT,
+    cms_version           VARCHAR(20),
+    source_file           TEXT,
+    source_file_hash      VARCHAR(64) UNIQUE,
+    ingested_at           TIMESTAMP DEFAULT NOW(),
+    extra_metadata        JSONB
+);
+"""
+
+DDL_ITEMS = """
+CREATE TABLE IF NOT EXISTS mrf_items (
+    id                    BIGSERIAL PRIMARY KEY,
+    hospital_id           INT NOT NULL REFERENCES mrf_hospitals(id),
+    description           TEXT,
+    setting               VARCHAR(30),
+    billing_class         VARCHAR(30),
+    drug_unit_of_measure  VARCHAR(50),
+    drug_type_of_measure  VARCHAR(50),
+    gross_charge          NUMERIC(14,4),
+    discounted_cash       NUMERIC(14,4),
+    min_negotiated        NUMERIC(14,4),
+    max_negotiated        NUMERIC(14,4),
+    modifiers             VARCHAR(200),
+    median_amount         NUMERIC(14,4),
+    percentile_10th       NUMERIC(14,4),
+    percentile_90th       NUMERIC(14,4),
+    claims_count          INT,
+    additional_notes      TEXT,
+    footnote              TEXT,
+    count_compared_rates  INT,
+    extra_fields          JSONB,
+    source_file           TEXT,
+    row_number            INT,
+    layout_type           VARCHAR(20),
+    ingested_at           TIMESTAMP DEFAULT NOW()
+);
+"""
+
+DDL_ITEM_CODES = """
+CREATE TABLE IF NOT EXISTS mrf_item_codes (
+    id                    BIGSERIAL PRIMARY KEY,
+    item_id               BIGINT NOT NULL REFERENCES mrf_items(id),
+    code                  VARCHAR(100),
+    code_original         VARCHAR(100),
+    code_type             VARCHAR(20),
+    code_index            INT,
+    is_primary            BOOLEAN
+);
+"""
+
+DDL_RATES = """
+CREATE TABLE IF NOT EXISTS mrf_rates (
+    id                    BIGSERIAL PRIMARY KEY,
+    item_id               BIGINT NOT NULL REFERENCES mrf_items(id),
+    payer_name_raw        VARCHAR(500),
+    plan_name_raw         VARCHAR(500),
+    plan_tier_index       INT DEFAULT 0,
+    negotiated_dollar     NUMERIC(14,4),
+    negotiated_percentage NUMERIC(10,4),
+    negotiated_algorithm  TEXT,
+    methodology           VARCHAR(100),
+    methodology_raw       VARCHAR(200),
+    estimated_amount      NUMERIC(14,4),
+    rate_flag             VARCHAR(50),
+    rate_note             TEXT,
+    additional_notes      TEXT,
+    setting_from_payer    VARCHAR(30),
+    layout_source         VARCHAR(20)
+);
+"""
+
+DDL_RAW = """
+CREATE TABLE IF NOT EXISTS mrf_raw (
+    id                    BIGSERIAL PRIMARY KEY,
+    hospital_id           INT,
+    item_id               BIGINT,
+    raw_row               TEXT,
+    source_file           TEXT,
+    row_number            INT,
+    ingested_at           TIMESTAMP DEFAULT NOW()
+);
+"""
+
+DDL_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_items_hospital ON mrf_items(hospital_id);",
+    "CREATE INDEX IF NOT EXISTS idx_codes_item ON mrf_item_codes(item_id);",
+    "CREATE INDEX IF NOT EXISTS idx_codes_code ON mrf_item_codes(code);",
+    "CREATE INDEX IF NOT EXISTS idx_rates_item ON mrf_rates(item_id);",
+    "CREATE INDEX IF NOT EXISTS idx_rates_payer ON mrf_rates(payer_name_raw);",
+    "CREATE INDEX IF NOT EXISTS idx_raw_item ON mrf_raw(item_id);",
+]
+
+ALL_DDL = [DDL_HOSPITALS, DDL_ITEMS, DDL_ITEM_CODES, DDL_RATES, DDL_RAW] + DDL_INDEXES
+
+
+class PostgresLoader(BaseLoader):
+    """
+    Loads MRFRow objects into a PostgreSQL database.
+
+    Usage:
+        loader = PostgresLoader(
+            host="localhost", port=5432,
+            user="postgres", password="pass",
+            database="mrf_db"
+        )
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5432,
+        user: str = "postgres",
+        password: str = "",
+        database: str = "mrf_db",
+        chunk_size: int = 500,
+    ):
+        super().__init__(chunk_size=chunk_size)
+        if psycopg2 is None:
+            raise ImportError("psycopg2 is required: pip install psycopg2-binary")
+        self._dsn = dict(
+            host=host, port=port, user=user,
+            password=password, dbname=database
+        )
+        self._conn: Optional[psycopg2.extensions.connection] = None
+
+    def _conn_get(self):
+        if self._conn is None or self._conn.closed:
+            self._conn = psycopg2.connect(**self._dsn)
+        return self._conn
+
+    def close(self):
+        if self._conn and not self._conn.closed:
+            self._conn.close()
+
+    def _ensure_schema(self) -> None:
+        conn = self._conn_get()
+        with conn.cursor() as cur:
+            for ddl in ALL_DDL:
+                cur.execute(ddl)
+        conn.commit()
+
+    def file_already_loaded(self, source_file: str) -> bool:
+        h = _file_hash(source_file)
+        conn = self._conn_get()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM mrf_hospitals WHERE source_file_hash = %s LIMIT 1",
+                (h,)
+            )
+            return cur.fetchone() is not None
+
+    def _upsert_hospital(self, meta: HospitalMeta) -> int:
+        conn = self._conn_get()
+        h = _file_hash(meta.source_file or "")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM mrf_hospitals WHERE source_file_hash = %s",
+                (h,)
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+
+            cur.execute(
+                """INSERT INTO mrf_hospitals
+                   (hospital_name, hospital_locations, hospital_addresses,
+                    license_number, license_state, hospital_npi, attester_name,
+                    last_updated_on, as_of_date, financial_aid_policy,
+                    cms_version, source_file, source_file_hash, extra_metadata)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   RETURNING id""",
+                (
+                    meta.hospital_name,
+                    _json_safe(meta.hospital_locations),
+                    _json_safe(meta.hospital_addresses),
+                    meta.license_number, meta.license_state,
+                    meta.hospital_npi, meta.attester_name,
+                    meta.last_updated_on or None, meta.as_of_date or None,
+                    meta.financial_aid_policy, meta.cms_version,
+                    meta.source_file, h,
+                    _json_safe(meta.extra_metadata),
+                )
+            )
+            hospital_id = cur.fetchone()[0]
+        conn.commit()
+        return hospital_id
+
+    def _insert_items_batch(self, batch: list[dict], hospital_id: int) -> list[int]:
+        conn = self._conn_get()
+        sql = """
+            INSERT INTO mrf_items
+              (hospital_id, description, setting, billing_class,
+               drug_unit_of_measure, drug_type_of_measure,
+               gross_charge, discounted_cash, min_negotiated, max_negotiated,
+               modifiers, median_amount, percentile_10th, percentile_90th,
+               claims_count, additional_notes, footnote, count_compared_rates,
+               extra_fields, source_file, row_number, layout_type)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """
+        ids = []
+        with conn.cursor() as cur:
+            for item in batch:
+                cur.execute(sql, (
+                    hospital_id, item["description"], item["setting"],
+                    item["billing_class"], item["drug_unit_of_measure"],
+                    item["drug_type_of_measure"], item["gross_charge"],
+                    item["discounted_cash"], item["min_negotiated"],
+                    item["max_negotiated"], item["modifiers"],
+                    item["median_amount"], item["percentile_10th"],
+                    item["percentile_90th"], item["claims_count"],
+                    item["additional_notes"], item["footnote"],
+                    item["count_compared_rates"], item["extra_fields"],
+                    item["source_file"], item["row_number"], item["layout_type"],
+                ))
+                ids.append(cur.fetchone()[0])
+        conn.commit()
+        return ids
+
+    def _insert_codes_batch(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+        conn = self._conn_get()
+        sql = """INSERT INTO mrf_item_codes
+                 (item_id, code, code_original, code_type, code_index, is_primary)
+                 VALUES %s"""
+        data = [
+            (r["item_id"], r["code"], r["code_original"],
+             r["code_type"], r["code_index"], r["is_primary"])
+            for r in batch
+        ]
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, data)
+        conn.commit()
+
+    def _insert_rates_batch(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+        conn = self._conn_get()
+        sql = """INSERT INTO mrf_rates
+                 (item_id, payer_name_raw, plan_name_raw, plan_tier_index,
+                  negotiated_dollar, negotiated_percentage, negotiated_algorithm,
+                  methodology, methodology_raw, estimated_amount,
+                  rate_flag, rate_note, additional_notes,
+                  setting_from_payer, layout_source)
+                 VALUES %s"""
+        data = [
+            (r["item_id"], r["payer_name_raw"], r["plan_name_raw"],
+             r["plan_tier_index"], r["negotiated_dollar"],
+             r["negotiated_percentage"], r["negotiated_algorithm"],
+             r["methodology"], r["methodology_raw"], r["estimated_amount"],
+             r["rate_flag"], r["rate_note"], r["additional_notes"],
+             r["setting_from_payer"], r["layout_source"])
+            for r in batch
+        ]
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, data)
+        conn.commit()
+
+    def _insert_raw_batch(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+        conn = self._conn_get()
+        sql = """INSERT INTO mrf_raw
+                 (hospital_id, item_id, raw_row, source_file, row_number)
+                 VALUES %s"""
+        data = [
+            (r.get("hospital_id"), r["item_id"],
+             r["raw_row"], r["source_file"], r["row_number"])
+            for r in batch
+        ]
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, data)
+        conn.commit()
+
+
+def _file_hash(path: str) -> str:
+    return hashlib.sha256(path.encode()).hexdigest()
