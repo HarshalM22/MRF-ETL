@@ -2,7 +2,7 @@
 mrf-etl: Universal MRF CSV parser for hospital price transparency data.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "Harshal M"
 
 from mrf_etl.core.pipeline import parse_file, profile_file

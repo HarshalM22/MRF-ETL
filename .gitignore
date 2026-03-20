@@ -18,3 +18,4 @@ mrf_output/
 errors.txt
 failed_sources.txt
 *.pypirc
+.pypirc

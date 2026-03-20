@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mrf-etl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Universal MRF CSV parser for hospital price transparency data"
 readme = "README.md"                     
 license = "Apache-2.0"            
